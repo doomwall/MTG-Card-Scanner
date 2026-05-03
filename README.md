@@ -1,6 +1,6 @@
 # MTG Card Scanner
 
-A Windows desktop tool for identifying Magic: The Gathering cards directly from your screen. Press a hotkey, drag a selection over a card, and get the card name, mana cost, type, oracle text, and current price from Scryfall — instantly.
+A Windows desktop tool for identifying Magic: The Gathering cards directly from your screen. Highly inaccurate! Press a hotkey, drag a selection over a card, and get the card name, mana cost, type, oracle text, and current price from Scryfall — instantly.
 
 ---
 
