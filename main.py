@@ -67,14 +67,12 @@ class MTGScannerApp:
     def __init__(self) -> None:
         self._task_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._scanning = threading.Event()
-        self._debug_mode = tk.BooleanVar(value=False)
 
-        # Hidden root — owns all Toplevels
+        # Root must exist before any tk variables are created
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_NAME)
 
-        # Re-create BooleanVar now that the root exists
         self._debug_mode = tk.BooleanVar(value=False)
 
         self._build_status_window()
