@@ -21,6 +21,18 @@ import imagehash
 
 from config import HASH_MATCH_THRESHOLD, resolve_db_path
 
+# ── OCR reader (lazy-initialised on first use) ────────────────────────────────
+_ocr_reader = None
+
+def _get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        logger.info("Loading EasyOCR model (first run may take a moment)…")
+        import easyocr
+        _ocr_reader = easyocr.Reader(["en"], gpu=False)
+        logger.info("EasyOCR ready")
+    return _ocr_reader
+
 logger = logging.getLogger(__name__)
 
 _db: Optional[list] = None
@@ -77,8 +89,7 @@ def reload_db() -> None:
 
 
 def db_is_ready() -> bool:
-    _load_db()
-    return bool(_db)
+    return True  # OCR mode — no hash DB needed
 
 
 # ── preprocessing ─────────────────────────────────────────────────────────────
@@ -193,57 +204,48 @@ def get_preprocessing_steps(img: Image.Image) -> List[tuple]:
 
 def find_best_match(
     img: Image.Image,
-    force_gray: Optional[Image.Image] = None,
+    force_gray: Optional[Image.Image] = None,  # unused in OCR mode, kept for compat
 ) -> Optional[Tuple[str, int]]:
-    """Return (card_name, hamming_distance) for the closest match, or None.
+    """Read the card name from the name-bar region using OCR."""
+    w, h = img.size
 
-    Matching uses two pHashes per card:
-      gray_dist  — structural / artwork similarity (from multiple preprocessings)
-      hue_dist   — frame/background colour similarity
+    # Crop the name bar — top strip of the card, left of the mana cost
+    name_bar = img.crop((
+        int(w * 0.04), int(h * 0.03),
+        int(w * 0.85), int(h * 0.11),
+    ))
 
-    Combined score = gray_dist + HUE_WEIGHT * hue_dist
-    Cards with similar art but a wrong frame colour are pushed down the ranking.
-    """
-    _load_db()
-    if not _db:
+    # Scale up so OCR sees larger text
+    scale = 4
+    name_bar = name_bar.resize(
+        (name_bar.width * scale, name_bar.height * scale),
+        Image.LANCZOS,
+    )
+
+    # High-contrast greyscale helps OCR
+    arr = cv2.cvtColor(np.array(name_bar), cv2.COLOR_RGB2GRAY)
+    arr = cv2.adaptiveThreshold(
+        arr, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10,
+    )
+
+    reader  = _get_ocr_reader()
+    results = reader.readtext(arr, detail=1)
+
+    if not results:
+        logger.warning("OCR returned no text")
         return None
 
-    if force_gray is not None:
-        query_grays = [int(str(imagehash.phash(force_gray)), 16)]
-        logger.info("Using forced preprocessing variant for gray hash")
-    else:
-        query_grays = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
-    query_hue = _compute_hue_hash(img)
+    # Pick the result with the highest confidence
+    best      = max(results, key=lambda r: r[2])
+    card_name = best[1].strip()
+    confidence = best[2]           # 0.0–1.0
 
-    best_name:  Optional[str] = None
-    best_score: float         = float("inf")
-    best_dist:  int           = HASH_MATCH_THRESHOLD + 1
+    if not card_name:
+        return None
 
-    for name, gray_int, hue_int in _db:
-        gray_dist = min(bin(q ^ gray_int).count("1") for q in query_grays)
-
-        # Only score candidates that could possibly be within threshold
-        if gray_dist > HASH_MATCH_THRESHOLD:
-            continue
-
-        if hue_int is not None:
-            hue_dist = bin(query_hue ^ hue_int).count("1")
-        else:
-            hue_dist = 0  # old DB row without hue hash — no colour adjustment
-
-        score = gray_dist + HUE_WEIGHT * hue_dist
-
-        if score < best_score:
-            best_score = score
-            best_name  = name
-            best_dist  = gray_dist
-
-    if best_name and best_dist <= HASH_MATCH_THRESHOLD:
-        logger.info(
-            "Recognised '%s'  (gray_dist=%d  score=%.1f)",
-            best_name, best_dist, best_score,
-        )
-        return best_name, best_dist
-
-    logger.warning("No match within threshold")
-    return None
+    # Map confidence to a pseudo-distance (0 = perfect, 64 = worst)
+    pseudo_dist = int((1.0 - confidence) * 64)
+    logger.info("OCR: '%s'  (confidence=%.2f)", card_name, confidence)
+    return card_name, pseudo_dist
