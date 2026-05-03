@@ -39,10 +39,11 @@ from config import APP_NAME, APP_VERSION, CACHE_DIR, DATA_DIR, DB_PATH, HOTKEY
 from hotkey_listener import HotkeyListener
 from selector import select_region
 from capture import capture_region
-from recognizer import find_best_match, db_is_ready
+from recognizer import find_best_match, db_is_ready, get_preprocessing_steps
 from scryfall import get_card_by_exact_name, get_card_by_fuzzy_name
 from card_picker import pick_card
 from popup import show_card_popup
+from debug_view import show_preprocessing_steps
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -66,11 +67,15 @@ class MTGScannerApp:
     def __init__(self) -> None:
         self._task_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._scanning = threading.Event()
+        self._debug_mode = tk.BooleanVar(value=False)
 
         # Hidden root — owns all Toplevels
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_NAME)
+
+        # Re-create BooleanVar now that the root exists
+        self._debug_mode = tk.BooleanVar(value=False)
 
         self._build_status_window()
         self._poll_queue()
@@ -115,15 +120,41 @@ class MTGScannerApp:
                 font=("Consolas", 8),
             ).pack(padx=16, pady=(0, 6))
 
+        # ── button row ────────────────────────────────────────────────────
+        btn_row = tk.Frame(win, bg="#1e1e2e")
+        btn_row.pack(pady=(0, 8))
+
         tk.Button(
-            win,
+            btn_row,
+            text=f"Scan  ({HOTKEY.strip('<>').upper()})",
+            command=self.enqueue_scan,
+            bg="#89b4fa", fg="#1e1e2e",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=12, pady=4,
+            cursor="hand2",
+        ).pack(side="left", padx=(16, 6))
+
+        tk.Button(
+            btn_row,
             text="Quit",
             command=self._on_quit,
             bg="#45475a", fg="#cdd6f4",
             font=("Segoe UI", 9),
-            relief="flat", padx=10, pady=3,
+            relief="flat", padx=10, pady=4,
             cursor="hand2",
-        ).pack(pady=(0, 10))
+        ).pack(side="left", padx=(0, 16))
+
+        # ── debug toggle ──────────────────────────────────────────────────
+        tk.Checkbutton(
+            win,
+            text="Show preprocessing debug",
+            variable=self._debug_mode,
+            bg="#1e1e2e", fg="#6c7086",
+            selectcolor="#313244",
+            activebackground="#1e1e2e",
+            font=("Segoe UI", 8),
+            cursor="hand2",
+        ).pack(pady=(0, 8))
 
     # ── queue polling (main thread) ───────────────────────────────────────
 
@@ -179,7 +210,12 @@ class MTGScannerApp:
         if card_img is None:
             card_img = raw_img   # no outline detected; use full capture as before
 
-        # 4. Card recognition
+        # 4. Debug window (optional)
+        if self._debug_mode.get():
+            steps = get_preprocessing_steps(card_img)
+            show_preprocessing_steps(self.root, steps)
+
+        # 5. Card recognition
         if not db_is_ready():
             messagebox.showwarning(
                 APP_NAME,

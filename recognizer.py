@@ -130,6 +130,46 @@ def _variants(img: Image.Image) -> List[Image.Image]:
     return out
 
 
+# ── debug helper ─────────────────────────────────────────────────────────────
+
+def get_preprocessing_steps(img: Image.Image) -> List[tuple]:
+    """Return (label, PIL Image) for every stage of the preprocessing pipeline.
+
+    Called by debug_view.py to populate the debug grid window.
+    """
+    gray = _to_gray(img)
+    steps = []
+
+    steps.append(("Original", img.convert("RGB")))
+    steps.append(("Greyscale", Image.fromarray(gray)))
+
+    # v1
+    v1 = _apply_clahe(gray.copy())
+    steps.append(("v1 — CLAHE", Image.fromarray(_resize(v1))))
+
+    # v2
+    v2 = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+    steps.append(("v2 — Denoise", Image.fromarray(v2)))
+    steps.append(("v2 — Denoise + CLAHE", Image.fromarray(_resize(_apply_clahe(v2)))))
+
+    # v3
+    v3 = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
+    v3s = np.clip(cv2.filter2D(v3, -1, _SHARPEN_KERNEL), 0, 255).astype(np.uint8)
+    steps.append(("v3 — Denoise + Sharpen", Image.fromarray(v3s)))
+    steps.append(("v3 — + CLAHE", Image.fromarray(_resize(_apply_clahe(v3s, clip=3.0)))))
+
+    # v4
+    v4 = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    steps.append(("v4 — Bilateral", Image.fromarray(v4)))
+    steps.append(("v4 — Bilateral + CLAHE", Image.fromarray(_resize(_apply_clahe(v4)))))
+
+    # Hue channel
+    hsv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2HSV)
+    steps.append(("Hue channel", Image.fromarray(hsv[:, :, 0])))
+
+    return steps
+
+
 # ── hue hash ─────────────────────────────────────────────────────────────────
 
 def _compute_hue_hash(img: Image.Image) -> int:
