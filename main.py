@@ -41,6 +41,7 @@ from selector import select_region
 from capture import capture_region
 from recognizer import find_best_match, db_is_ready
 from scryfall import get_card_by_exact_name, get_card_by_fuzzy_name
+from card_picker import pick_card
 from popup import show_card_popup
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -169,13 +170,19 @@ class MTGScannerApp:
 
         # 2. Screen capture
         try:
-            img = capture_region(x1, y1, x2, y2)
+            raw_img = capture_region(x1, y1, x2, y2)
         except Exception as exc:
             logger.error("Capture failed: %s", exc)
             messagebox.showerror(APP_NAME, f"Screen capture failed:\n{exc}", parent=self.root)
             return
 
-        # 3. Card recognition
+        # 3. Card detection — let user pick one if multiple are visible.
+        #    Falls back to full capture when no card outline is found.
+        card_img = pick_card(self.root, raw_img)
+        if card_img is None:
+            card_img = raw_img   # no outline detected; use full capture as before
+
+        # 4. Card recognition
         if not db_is_ready():
             messagebox.showwarning(
                 APP_NAME,
@@ -186,7 +193,7 @@ class MTGScannerApp:
             )
             return
 
-        match = find_best_match(img)
+        match = find_best_match(card_img)
         if match is None:
             messagebox.showwarning(
                 APP_NAME,
