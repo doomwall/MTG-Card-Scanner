@@ -130,59 +130,71 @@ def _variants(img: Image.Image) -> List[Image.Image]:
     return out
 
 
+# ── hue helpers ───────────────────────────────────────────────────────────────
+
+def _masked_hue(arr: np.ndarray) -> np.ndarray:
+    """Return the hue channel with achromatic pixels zeroed out.
+
+    Pixels with low saturation have no meaningful hue (white, black, grey
+    all return random hue noise).  Setting them to 0 keeps the image clean
+    and stops undefined values from polluting the hash.
+    """
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0].copy()
+    hue[hsv[:, :, 1] < 30] = 0   # silence achromatic pixels
+    return hue
+
+
+def _compute_hue_hash(img: Image.Image) -> int:
+    """pHash of the saturation-masked hue channel."""
+    arr = np.array(img.convert("RGB"))
+    hue_img = Image.fromarray(_masked_hue(arr)).resize((_HASH_W, _HASH_H))
+    return int(str(imagehash.phash(hue_img)), 16)
+
+
 # ── debug helper ─────────────────────────────────────────────────────────────
 
 def get_preprocessing_steps(img: Image.Image) -> List[tuple]:
-    """Return (label, PIL Image) for every stage of the preprocessing pipeline.
+    """Return (label, image, selectable) tuples for every pipeline stage.
 
-    Called by debug_view.py to populate the debug grid window.
+    selectable=True marks the four final variants the user can click to
+    force a specific preprocessing for the hash comparison.
     """
     gray = _to_gray(img)
-    steps = []
+    steps: List[tuple] = []
 
-    steps.append(("Original", img.convert("RGB")))
-    steps.append(("Greyscale", Image.fromarray(gray)))
+    steps.append(("Original",   img.convert("RGB"),        False))
+    steps.append(("Greyscale",  Image.fromarray(gray),     False))
 
-    # v1
     v1 = _apply_clahe(gray.copy())
-    steps.append(("v1 — CLAHE", Image.fromarray(_resize(v1))))
+    steps.append(("v1 — CLAHE",              Image.fromarray(_resize(v1)),  True))
 
-    # v2
     v2 = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
-    steps.append(("v2 — Denoise", Image.fromarray(v2)))
-    steps.append(("v2 — Denoise + CLAHE", Image.fromarray(_resize(_apply_clahe(v2)))))
+    steps.append(("v2 — Denoise",            Image.fromarray(v2),           False))
+    steps.append(("v2 — Denoise + CLAHE",    Image.fromarray(_resize(_apply_clahe(v2))), True))
 
-    # v3
     v3 = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
     v3s = np.clip(cv2.filter2D(v3, -1, _SHARPEN_KERNEL), 0, 255).astype(np.uint8)
-    steps.append(("v3 — Denoise + Sharpen", Image.fromarray(v3s)))
-    steps.append(("v3 — + CLAHE", Image.fromarray(_resize(_apply_clahe(v3s, clip=3.0)))))
+    steps.append(("v3 — Denoise + Sharpen",  Image.fromarray(v3s),          False))
+    steps.append(("v3 — + CLAHE",            Image.fromarray(_resize(_apply_clahe(v3s, clip=3.0))), True))
 
-    # v4
     v4 = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-    steps.append(("v4 — Bilateral", Image.fromarray(v4)))
-    steps.append(("v4 — Bilateral + CLAHE", Image.fromarray(_resize(_apply_clahe(v4)))))
+    steps.append(("v4 — Bilateral",          Image.fromarray(v4),           False))
+    steps.append(("v4 — Bilateral + CLAHE",  Image.fromarray(_resize(_apply_clahe(v4))), True))
 
-    # Hue channel
-    hsv = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2HSV)
-    steps.append(("Hue channel", Image.fromarray(hsv[:, :, 0])))
+    steps.append(("Hue (masked)",
+                  Image.fromarray(_masked_hue(np.array(img.convert("RGB")))),
+                  False))
 
     return steps
 
 
-# ── hue hash ─────────────────────────────────────────────────────────────────
-
-def _compute_hue_hash(img: Image.Image) -> int:
-    """pHash of the hue channel — captures frame/background colour."""
-    arr = np.array(img.convert("RGB"))
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    hue_img = Image.fromarray(hsv[:, :, 0]).resize((_HASH_W, _HASH_H))
-    return int(str(imagehash.phash(hue_img)), 16)
-
-
 # ── matching ──────────────────────────────────────────────────────────────────
 
-def find_best_match(img: Image.Image) -> Optional[Tuple[str, int]]:
+def find_best_match(
+    img: Image.Image,
+    force_gray: Optional[Image.Image] = None,
+) -> Optional[Tuple[str, int]]:
     """Return (card_name, hamming_distance) for the closest match, or None.
 
     Matching uses two pHashes per card:
@@ -196,8 +208,12 @@ def find_best_match(img: Image.Image) -> Optional[Tuple[str, int]]:
     if not _db:
         return None
 
-    query_grays = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
-    query_hue   = _compute_hue_hash(img)
+    if force_gray is not None:
+        query_grays = [int(str(imagehash.phash(force_gray)), 16)]
+        logger.info("Using forced preprocessing variant for gray hash")
+    else:
+        query_grays = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
+    query_hue = _compute_hue_hash(img)
 
     best_name:  Optional[str] = None
     best_score: float         = float("inf")

@@ -43,7 +43,7 @@ from recognizer import find_best_match, db_is_ready, get_preprocessing_steps
 from scryfall import get_card_by_exact_name, get_card_by_fuzzy_name
 from card_picker import pick_card
 from popup import show_card_popup
-from debug_view import show_preprocessing_steps
+from debug_view import show_debug_window
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -211,7 +211,9 @@ class MTGScannerApp:
         # 4. Debug window (optional)
         if self._debug_mode.get():
             steps = get_preprocessing_steps(card_img)
-            show_preprocessing_steps(self.root, steps)
+            forced_variant = show_debug_window(self.root, steps)
+        else:
+            forced_variant = None
 
         # 5. Card recognition
         if not db_is_ready():
@@ -224,7 +226,7 @@ class MTGScannerApp:
             )
             return
 
-        match = find_best_match(card_img)
+        match = find_best_match(card_img, force_gray=forced_variant)
         if match is None:
             messagebox.showwarning(
                 APP_NAME,
