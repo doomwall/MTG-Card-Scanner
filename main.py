@@ -38,7 +38,6 @@ if sys.platform == "win32":
 from config import APP_NAME, APP_VERSION, CACHE_DIR, DATA_DIR, DB_PATH, HOTKEY
 from hotkey_listener import HotkeyListener
 from selector import select_region
-from capture import capture_region
 from recognizer import find_best_match, db_is_ready, get_preprocessing_steps
 from scryfall import get_card_by_exact_name, get_card_by_fuzzy_name
 from card_picker import pick_card

@@ -1,13 +1,14 @@
-"""Card recognition via perceptual hashing.
+"""Card recognition — pHash with OCR fallback.
 
-Pipeline:
-  1. Build several preprocessed variants of the capture (see _variants).
-  2. Compute a 64-bit pHash for each variant.
-  3. Linear scan against the in-memory hash table from SQLite.
-  4. Return the closest match found across all variants.
+Phase 1 — perceptual hashing:
+  Tries four preprocessed variants of the capture (CLAHE, denoise,
+  denoise+sharpen, bilateral) against the SQLite hash database.
+  Returns immediately if a match is found within HASH_MATCH_THRESHOLD.
 
-Multiple variants help because we don't know up-front whether the webcam
-image needs denoising, sharpening, or just contrast normalisation.
+Phase 2 — OCR fallback (only reached when pHash finds nothing):
+  Crops the card name-bar, sharpens it, and reads the text with EasyOCR.
+  The result is passed to Scryfall's fuzzy-name endpoint which handles
+  minor OCR errors.
 """
 
 import sqlite3
@@ -21,33 +22,20 @@ import imagehash
 
 from config import HASH_MATCH_THRESHOLD, resolve_db_path
 
-# ── OCR reader (lazy-initialised on first use) ────────────────────────────────
-_ocr_reader = None
-
-def _get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        logger.info("Loading EasyOCR model (first run may take a moment)…")
-        import easyocr
-        _ocr_reader = easyocr.Reader(["en"], gpu=False)
-        logger.info("EasyOCR ready")
-    return _ocr_reader
-
 logger = logging.getLogger(__name__)
 
 _db: Optional[list] = None
-_HASH_W, _HASH_H = 256, 358
+_HASH_W, _HASH_H    = 256, 358
+HUE_WEIGHT          = 0.5
 
-# How much the hue hash contributes to the combined score.
-# 0.0 = ignore colour entirely  /  1.0 = weight equal to grayscale.
-HUE_WEIGHT = 0.5
-
-# Unsharp-mask kernel — enhances edges without over-amplifying noise
 _SHARPEN_KERNEL = np.array([
     [ 0, -1,  0],
     [-1,  5, -1],
     [ 0, -1,  0],
 ], dtype=np.float32)
+
+# EasyOCR reader — lazy-initialised on first OCR attempt
+_ocr_reader = None
 
 
 # ── database ──────────────────────────────────────────────────────────────────
@@ -72,7 +60,6 @@ def _load_db() -> None:
     finally:
         conn.close()
 
-    # Load both hashes; hue_hash_int may be NULL for old DB rows
     _db = [
         (name,
          gray & 0xFFFFFFFFFFFFFFFF,
@@ -89,10 +76,11 @@ def reload_db() -> None:
 
 
 def db_is_ready() -> bool:
-    return True  # OCR mode — no hash DB needed
+    _load_db()
+    return bool(_db)
 
 
-# ── preprocessing ─────────────────────────────────────────────────────────────
+# ── preprocessing helpers ─────────────────────────────────────────────────────
 
 def _to_gray(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
@@ -107,90 +95,63 @@ def _resize(arr: np.ndarray) -> np.ndarray:
 
 
 def _variants(img: Image.Image) -> List[Image.Image]:
-    """Return several preprocessed versions of the capture to try.
-
-    v1  Plain CLAHE — works well for clean screen captures.
-    v2  Denoise → CLAHE — removes webcam sensor noise first.
-    v3  Denoise → sharpen → CLAHE — recovers detail lost to webcam blur.
-    v4  Bilateral filter → CLAHE — edge-preserving smooth for low-light shots.
-    """
+    """Four preprocessed greyscale versions tried against the hash DB."""
     gray = _to_gray(img)
-    out = []
 
-    # v1: plain CLAHE
     v1 = _apply_clahe(gray.copy())
-    out.append(Image.fromarray(_resize(v1)))
 
-    # v2: fast denoise → CLAHE
     v2 = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
     v2 = _apply_clahe(v2)
-    out.append(Image.fromarray(_resize(v2)))
 
-    # v3: denoise → sharpen → CLAHE
     v3 = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
-    v3 = cv2.filter2D(v3, -1, _SHARPEN_KERNEL)
-    v3 = np.clip(v3, 0, 255).astype(np.uint8)
+    v3 = np.clip(cv2.filter2D(v3, -1, _SHARPEN_KERNEL), 0, 255).astype(np.uint8)
     v3 = _apply_clahe(v3, clip=3.0)
-    out.append(Image.fromarray(_resize(v3)))
 
-    # v4: bilateral (preserves edges, smooths flat areas) → CLAHE
     v4 = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
     v4 = _apply_clahe(v4)
-    out.append(Image.fromarray(_resize(v4)))
 
-    return out
+    return [Image.fromarray(_resize(a)) for a in (v1, v2, v3, v4)]
 
-
-# ── hue helpers ───────────────────────────────────────────────────────────────
 
 def _masked_hue(arr: np.ndarray) -> np.ndarray:
-    """Return the hue channel with achromatic pixels zeroed out.
-
-    Pixels with low saturation have no meaningful hue (white, black, grey
-    all return random hue noise).  Setting them to 0 keeps the image clean
-    and stops undefined values from polluting the hash.
-    """
+    """Hue channel with achromatic pixels zeroed (they carry no colour info)."""
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
     hue = hsv[:, :, 0].copy()
-    hue[hsv[:, :, 1] < 30] = 0   # silence achromatic pixels
+    hue[hsv[:, :, 1] < 30] = 0
     return hue
 
 
 def _compute_hue_hash(img: Image.Image) -> int:
-    """pHash of the saturation-masked hue channel."""
     arr = np.array(img.convert("RGB"))
-    hue_img = Image.fromarray(_masked_hue(arr)).resize((_HASH_W, _HASH_H))
-    return int(str(imagehash.phash(hue_img)), 16)
+    return int(str(imagehash.phash(
+        Image.fromarray(_masked_hue(arr)).resize((_HASH_W, _HASH_H))
+    )), 16)
 
 
-# ── debug helper ─────────────────────────────────────────────────────────────
+# ── debug helper ──────────────────────────────────────────────────────────────
 
 def get_preprocessing_steps(img: Image.Image) -> List[tuple]:
-    """Return (label, image, selectable) tuples for every pipeline stage.
-
-    selectable=True marks the four final variants the user can click to
-    force a specific preprocessing for the hash comparison.
-    """
-    gray = _to_gray(img)
+    """Return (label, image, selectable) tuples for the debug grid window."""
+    gray  = _to_gray(img)
     steps: List[tuple] = []
 
-    steps.append(("Original",   img.convert("RGB"),        False))
-    steps.append(("Greyscale",  Image.fromarray(gray),     False))
+    steps.append(("Original",             img.convert("RGB"),        False))
+    steps.append(("Greyscale",            Image.fromarray(gray),     False))
 
     v1 = _apply_clahe(gray.copy())
-    steps.append(("v1 — CLAHE",              Image.fromarray(_resize(v1)),  True))
+    steps.append(("v1 — CLAHE",           Image.fromarray(_resize(v1)),  True))
 
     v2 = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
-    steps.append(("v2 — Denoise",            Image.fromarray(v2),           False))
-    steps.append(("v2 — Denoise + CLAHE",    Image.fromarray(_resize(_apply_clahe(v2))), True))
+    steps.append(("v2 — Denoise",         Image.fromarray(v2),           False))
+    steps.append(("v2 — Denoise + CLAHE", Image.fromarray(_resize(_apply_clahe(v2))), True))
 
     v3 = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
     v3s = np.clip(cv2.filter2D(v3, -1, _SHARPEN_KERNEL), 0, 255).astype(np.uint8)
-    steps.append(("v3 — Denoise + Sharpen",  Image.fromarray(v3s),          False))
-    steps.append(("v3 — + CLAHE",            Image.fromarray(_resize(_apply_clahe(v3s, clip=3.0))), True))
+    steps.append(("v3 — Denoise + Sharpen", Image.fromarray(v3s),        False))
+    steps.append(("v3 — + CLAHE",           Image.fromarray(_resize(_apply_clahe(v3s, clip=3.0))), True))
 
     v4 = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-    steps.append(("v4 — Bilateral",          Image.fromarray(v4),           False))
+    steps.append(("v4 — Bilateral",          Image.fromarray(v4),        False))
     steps.append(("v4 — Bilateral + CLAHE",  Image.fromarray(_resize(_apply_clahe(v4))), True))
 
     steps.append(("Hue (masked)",
@@ -200,52 +161,101 @@ def get_preprocessing_steps(img: Image.Image) -> List[tuple]:
     return steps
 
 
-# ── matching ──────────────────────────────────────────────────────────────────
+# ── phase 1: perceptual hash ──────────────────────────────────────────────────
 
-def find_best_match(
+def _phash_match(
     img: Image.Image,
-    force_gray: Optional[Image.Image] = None,  # unused in OCR mode, kept for compat
+    force_gray: Optional[Image.Image] = None,
 ) -> Optional[Tuple[str, int]]:
-    """Read the card name from the name-bar region using OCR."""
-    w, h = img.size
-
-    # Crop the name bar — top strip of the card, left of the mana cost
-    name_bar = img.crop((
-        int(w * 0.04), int(h * 0.03),
-        int(w * 0.85), int(h * 0.11),
-    ))
-
-    # Scale up so OCR sees larger text
-    scale = 4
-    name_bar = name_bar.resize(
-        (name_bar.width * scale, name_bar.height * scale),
-        Image.LANCZOS,
-    )
-
-    # High-contrast greyscale helps OCR
-    arr = cv2.cvtColor(np.array(name_bar), cv2.COLOR_RGB2GRAY)
-    arr = cv2.adaptiveThreshold(
-        arr, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10,
-    )
-
-    reader  = _get_ocr_reader()
-    results = reader.readtext(arr, detail=1)
-
-    if not results:
-        logger.warning("OCR returned no text")
+    _load_db()
+    if not _db:
         return None
 
-    # Pick the result with the highest confidence
-    best      = max(results, key=lambda r: r[2])
-    card_name = best[1].strip()
-    confidence = best[2]           # 0.0–1.0
+    query_grays = (
+        [int(str(imagehash.phash(force_gray)), 16)]
+        if force_gray is not None
+        else [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
+    )
+    query_hue = _compute_hue_hash(img)
+
+    best_name:  Optional[str] = None
+    best_score: float         = float("inf")
+    best_dist:  int           = HASH_MATCH_THRESHOLD + 1
+
+    for name, gray_int, hue_int in _db:
+        gray_dist = min(bin(q ^ gray_int).count("1") for q in query_grays)
+        if gray_dist > HASH_MATCH_THRESHOLD:
+            continue
+
+        hue_dist = bin(query_hue ^ hue_int).count("1") if hue_int is not None else 0
+        score    = gray_dist + HUE_WEIGHT * hue_dist
+
+        if score < best_score:
+            best_score = score
+            best_name  = name
+            best_dist  = gray_dist
+
+    if best_name and best_dist <= HASH_MATCH_THRESHOLD:
+        logger.info("pHash match: '%s' (dist=%d score=%.1f)", best_name, best_dist, best_score)
+        return best_name, best_dist
+
+    return None
+
+
+# ── phase 2: OCR fallback ─────────────────────────────────────────────────────
+
+def _get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        logger.info("Loading EasyOCR model (first OCR attempt may be slow)…")
+        import easyocr
+        _ocr_reader = easyocr.Reader(["en"], gpu=False)
+        logger.info("EasyOCR ready")
+    return _ocr_reader
+
+
+def _ocr_match(img: Image.Image) -> Optional[Tuple[str, int]]:
+    w, h = img.size
+
+    # Crop name bar — top strip, left of the mana cost symbols
+    name_bar = img.crop((int(w * 0.04), int(h * 0.03),
+                         int(w * 0.85), int(h * 0.11)))
+
+    # Scale up and sharpen so OCR sees larger, crisper text
+    name_bar = name_bar.resize((name_bar.width * 4, name_bar.height * 4), Image.LANCZOS)
+    arr = cv2.cvtColor(np.array(name_bar), cv2.COLOR_RGB2GRAY)
+    arr = cv2.adaptiveThreshold(
+        arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
+    )
+
+    results = _get_ocr_reader().readtext(arr, detail=1)
+    if not results:
+        logger.warning("OCR: no text found")
+        return None
+
+    best       = max(results, key=lambda r: r[2])
+    card_name  = best[1].strip()
+    confidence = best[2]
 
     if not card_name:
         return None
 
-    # Map confidence to a pseudo-distance (0 = perfect, 64 = worst)
     pseudo_dist = int((1.0 - confidence) * 64)
-    logger.info("OCR: '%s'  (confidence=%.2f)", card_name, confidence)
+    logger.info("OCR match: '%s' (confidence=%.2f)", card_name, confidence)
     return card_name, pseudo_dist
+
+
+# ── public interface ──────────────────────────────────────────────────────────
+
+def find_best_match(
+    img: Image.Image,
+    force_gray: Optional[Image.Image] = None,
+) -> Optional[Tuple[str, int]]:
+    """Try pHash first; fall back to OCR if no hash match is found."""
+
+    result = _phash_match(img, force_gray)
+    if result is not None:
+        return result
+
+    logger.info("pHash found no match — trying OCR fallback")
+    return _ocr_match(img)
