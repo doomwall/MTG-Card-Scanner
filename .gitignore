@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Scryfall bulk data (500 MB+, download separately)
+*.json
+
+# Windows metadata files
+*Zone.Identifier
+
+# Environment variables
+.env
+
+# Distribute cards.db as a release asset, not via git.
+# Uncomment the line below if you intentionally want to commit a small test DB.
+# *.db
