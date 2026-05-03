@@ -24,7 +24,9 @@ _OUTLINE = "#00ff41"
 _DIM     = 0.45   # how dark the overlay is (0 = black, 1 = original)
 
 
-def select_region(parent: tk.Tk) -> Optional[Tuple[int, int, int, int]]:
+def select_region(
+    parent: tk.Tk,
+) -> Optional[Tuple[Tuple[int, int, int, int], "Image.Image"]]:
     result: list = [None]
     start:  list = [0, 0]
 
@@ -103,7 +105,9 @@ def select_region(parent: tk.Tk) -> Optional[Tuple[int, int, int, int]]:
         x2 = max(start[0], event.x)
         y2 = max(start[1], event.y)
         if x2 - x1 >= MIN_SELECTION_SIZE and y2 - y1 >= MIN_SELECTION_SIZE:
-            result[0] = (x1, y1, x2, y2)
+            # Return the region AND the screenshot already in memory —
+            # the caller crops from this instead of taking a second screenshot.
+            result[0] = ((x1, y1, x2, y2), bg_orig)
             logger.debug("Region selected: (%d,%d)→(%d,%d)", x1, y1, x2, y2)
         else:
             logger.debug("Selection too small, discarded")

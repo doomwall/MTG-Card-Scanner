@@ -159,22 +159,19 @@ class MTGScannerApp:
             self._status_var.set(f"Press  {HOTKEY.strip('<>').upper()}  to scan a card")
 
     def _pipeline(self) -> None:
-        # 1. Region selection
-        region = select_region(self.root)
-        if region is None:
+        # 1. Region selection — also returns the frozen screenshot taken
+        #    before the overlay appeared, so no second grab is needed.
+        selection = select_region(self.root)
+        if selection is None:
             logger.info("Selection cancelled")
             return
 
-        x1, y1, x2, y2 = region
+        (x1, y1, x2, y2), screenshot = selection
         logger.info("Selected region (%d,%d)→(%d,%d)", x1, y1, x2, y2)
 
-        # 2. Screen capture
-        try:
-            raw_img = capture_region(x1, y1, x2, y2)
-        except Exception as exc:
-            logger.error("Capture failed: %s", exc)
-            messagebox.showerror(APP_NAME, f"Screen capture failed:\n{exc}", parent=self.root)
-            return
+        # 2. Crop from the already-captured screenshot (same frame the user
+        #    saw in the overlay — cards can't have moved between the two).
+        raw_img = screenshot.crop((x1, y1, x2, y2))
 
         # 3. Card detection — let user pick one if multiple are visible.
         #    Falls back to full capture when no card outline is found.
