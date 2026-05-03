@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 _db: Optional[list] = None
 _HASH_W, _HASH_H = 256, 358
 
+# How much the hue hash contributes to the combined score.
+# 0.0 = ignore colour entirely  /  1.0 = weight equal to grayscale.
+HUE_WEIGHT = 0.5
+
 # Unsharp-mask kernel — enhances edges without over-amplifying noise
 _SHARPEN_KERNEL = np.array([
     [ 0, -1,  0],
@@ -51,12 +55,18 @@ def _load_db() -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT name, hash_int FROM cards WHERE hash_int IS NOT NULL"
+            "SELECT name, hash_int, hue_hash_int FROM cards WHERE hash_int IS NOT NULL"
         ).fetchall()
     finally:
         conn.close()
 
-    _db = [(name, h & 0xFFFFFFFFFFFFFFFF) for name, h in rows]
+    # Load both hashes; hue_hash_int may be NULL for old DB rows
+    _db = [
+        (name,
+         gray & 0xFFFFFFFFFFFFFFFF,
+         (hue & 0xFFFFFFFFFFFFFFFF) if hue is not None else None)
+        for name, gray, hue in rows
+    ]
     logger.info("Loaded %d card hashes from database", len(_db))
 
 
@@ -120,34 +130,64 @@ def _variants(img: Image.Image) -> List[Image.Image]:
     return out
 
 
+# ── hue hash ─────────────────────────────────────────────────────────────────
+
+def _compute_hue_hash(img: Image.Image) -> int:
+    """pHash of the hue channel — captures frame/background colour."""
+    arr = np.array(img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    hue_img = Image.fromarray(hsv[:, :, 0]).resize((_HASH_W, _HASH_H))
+    return int(str(imagehash.phash(hue_img)), 16)
+
+
 # ── matching ──────────────────────────────────────────────────────────────────
 
 def find_best_match(img: Image.Image) -> Optional[Tuple[str, int]]:
-    """Return (card_name, hamming_distance) for the closest match, or None."""
+    """Return (card_name, hamming_distance) for the closest match, or None.
+
+    Matching uses two pHashes per card:
+      gray_dist  — structural / artwork similarity (from multiple preprocessings)
+      hue_dist   — frame/background colour similarity
+
+    Combined score = gray_dist + HUE_WEIGHT * hue_dist
+    Cards with similar art but a wrong frame colour are pushed down the ranking.
+    """
     _load_db()
     if not _db:
         return None
 
-    query_ints = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
-    logger.debug("Trying %d preprocessing variants", len(query_ints))
+    query_grays = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
+    query_hue   = _compute_hue_hash(img)
 
-    best_name: Optional[str] = None
-    best_dist = HASH_MATCH_THRESHOLD + 1
+    best_name:  Optional[str] = None
+    best_score: float         = float("inf")
+    best_dist:  int           = HASH_MATCH_THRESHOLD + 1
 
-    for name, hash_int in _db:
-        for q in query_ints:
-            dist = bin(q ^ hash_int).count("1")
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
-            if best_dist == 0:
-                break
-        if best_dist == 0:
-            break
+    for name, gray_int, hue_int in _db:
+        gray_dist = min(bin(q ^ gray_int).count("1") for q in query_grays)
+
+        # Only score candidates that could possibly be within threshold
+        if gray_dist > HASH_MATCH_THRESHOLD:
+            continue
+
+        if hue_int is not None:
+            hue_dist = bin(query_hue ^ hue_int).count("1")
+        else:
+            hue_dist = 0  # old DB row without hue hash — no colour adjustment
+
+        score = gray_dist + HUE_WEIGHT * hue_dist
+
+        if score < best_score:
+            best_score = score
+            best_name  = name
+            best_dist  = gray_dist
 
     if best_name and best_dist <= HASH_MATCH_THRESHOLD:
-        logger.info("Recognised '%s' (distance %d)", best_name, best_dist)
+        logger.info(
+            "Recognised '%s'  (gray_dist=%d  score=%.1f)",
+            best_name, best_dist, best_score,
+        )
         return best_name, best_dist
 
-    logger.warning("No match within threshold (best distance %d)", best_dist)
+    logger.warning("No match within threshold")
     return None

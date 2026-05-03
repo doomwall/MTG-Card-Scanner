@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import cv2
+import numpy as np
 import requests
 from PIL import Image
 import imagehash
@@ -73,11 +75,19 @@ def _init_db(conn: sqlite3.Connection) -> None:
             set_code        TEXT,
             image_uri       TEXT,
             hash_int        INTEGER,
-            image_hash      TEXT
+            image_hash      TEXT,
+            hue_hash_int    INTEGER
         );
-        CREATE INDEX IF NOT EXISTS idx_hash ON cards(hash_int);
-        CREATE INDEX IF NOT EXISTS idx_name ON cards(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_hash     ON cards(hash_int);
+        CREATE INDEX IF NOT EXISTS idx_hue_hash ON cards(hue_hash_int);
+        CREATE INDEX IF NOT EXISTS idx_name     ON cards(name COLLATE NOCASE);
     """)
+    # Migrate existing DBs that pre-date the hue hash column
+    try:
+        conn.execute("ALTER TABLE cards ADD COLUMN hue_hash_int INTEGER")
+        logger.info("DB migrated: added hue_hash_int column")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
 
 
@@ -133,20 +143,34 @@ def _download_bulk_json(force: bool = False) -> Path:
 
 # ── image hashing ─────────────────────────────────────────────────────────────
 
-def _hash_from_url(url: str, session: requests.Session) -> Optional[int]:
+def _to_signed(h: int) -> int:
+    """Convert unsigned 64-bit pHash to signed for SQLite storage."""
+    return h - 2**64 if h >= 2**63 else h
+
+
+def _hashes_from_url(
+    url: str, session: requests.Session
+) -> tuple[Optional[int], Optional[int]]:
+    """Download image and return (gray_hash, hue_hash) as signed 64-bit ints."""
     try:
         resp = session.get(url, timeout=20)
         resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("L")
-        img = img.resize((_HASH_W, _HASH_H), Image.LANCZOS)
-        h = int(str(imagehash.phash(img)), 16)
-        # SQLite INTEGER is signed 64-bit; convert unsigned pHash to signed
-        if h >= 2**63:
-            h -= 2**64
-        return h
+        img = Image.open(io.BytesIO(resp.content))
+
+        # ── grayscale pHash (structure / artwork) ─────────────────────────
+        gray = img.convert("L").resize((_HASH_W, _HASH_H), Image.LANCZOS)
+        gray_hash = _to_signed(int(str(imagehash.phash(gray)), 16))
+
+        # ── hue-channel pHash (frame / background colour) ─────────────────
+        arr = np.array(img.convert("RGB"))
+        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+        hue_img = Image.fromarray(hsv[:, :, 0]).resize((_HASH_W, _HASH_H), Image.LANCZOS)
+        hue_hash = _to_signed(int(str(imagehash.phash(hue_img)), 16))
+
+        return gray_hash, hue_hash
     except Exception as exc:
         logger.debug("Image hash failed (%s): %s", url, exc)
-        return None
+        return None, None
 
 
 # ── main builder ──────────────────────────────────────────────────────────────
@@ -186,7 +210,8 @@ def build(
     already_hashed: set = {
         row[0]
         for row in conn.execute(
-            "SELECT scryfall_id FROM cards WHERE hash_int IS NOT NULL"
+            "SELECT scryfall_id FROM cards "
+            "WHERE hash_int IS NOT NULL AND hue_hash_int IS NOT NULL"
         )
     }
 
@@ -235,11 +260,13 @@ def build(
                     conn.commit()
                 continue
 
-            hash_int = _hash_from_url(image_uri, session)
-            if hash_int is not None:
+            gray_hash, hue_hash = _hashes_from_url(image_uri, session)
+            if gray_hash is not None:
                 conn.execute(
-                    "UPDATE cards SET hash_int = ?, image_hash = ? WHERE scryfall_id = ?",
-                    (hash_int, format(hash_int, "016x"), sid),
+                    "UPDATE cards SET hash_int = ?, image_hash = ?, hue_hash_int = ? "
+                    "WHERE scryfall_id = ?",
+                    (gray_hash, format(gray_hash & 0xFFFFFFFFFFFFFFFF, "016x"),
+                     hue_hash, sid),
                 )
                 already_hashed.add(sid)
                 hashed += 1
