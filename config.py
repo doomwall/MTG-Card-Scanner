@@ -51,4 +51,4 @@ MIN_SELECTION_SIZE = 20
 
 # Maximum perceptual hash Hamming distance (0–64) to count as a match.
 # 15 = good for clean screen captures; raise to 20–22 for webcam quality.
-HASH_MATCH_THRESHOLD = 15
+HASH_MATCH_THRESHOLD = 22
