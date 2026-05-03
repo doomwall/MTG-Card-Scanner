@@ -1,18 +1,18 @@
 """Card recognition via perceptual hashing.
 
 Pipeline:
-  1. Preprocess the captured image with OpenCV (grayscale, CLAHE, resize).
-  2. Compute a 64-bit pHash with imagehash.
-  3. Linear scan against the in-memory hash table loaded from SQLite.
-  4. Return the closest match if it's within HASH_MATCH_THRESHOLD.
+  1. Build several preprocessed variants of the capture (see _variants).
+  2. Compute a 64-bit pHash for each variant.
+  3. Linear scan against the in-memory hash table from SQLite.
+  4. Return the closest match found across all variants.
 
-The hash table (~240 KB for 30 k cards) fits comfortably in memory and
-makes linear Hamming-distance search fast enough (< 5 ms on a modern CPU).
+Multiple variants help because we don't know up-front whether the webcam
+image needs denoising, sharpening, or just contrast normalisation.
 """
 
 import sqlite3
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -23,12 +23,18 @@ from config import HASH_MATCH_THRESHOLD, resolve_db_path
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded in-memory table: list of (name, hash_as_int)
 _db: Optional[list] = None
-
-# Standard normalised size for hashing — matches what db_builder uses
 _HASH_W, _HASH_H = 256, 358
 
+# Unsharp-mask kernel — enhances edges without over-amplifying noise
+_SHARPEN_KERNEL = np.array([
+    [ 0, -1,  0],
+    [-1,  5, -1],
+    [ 0, -1,  0],
+], dtype=np.float32)
+
+
+# ── database ──────────────────────────────────────────────────────────────────
 
 def _load_db() -> None:
     global _db
@@ -50,13 +56,11 @@ def _load_db() -> None:
     finally:
         conn.close()
 
-    # Convert signed SQLite integers back to unsigned for XOR comparison
     _db = [(name, h & 0xFFFFFFFFFFFFFFFF) for name, h in rows]
     logger.info("Loaded %d card hashes from database", len(_db))
 
 
 def reload_db() -> None:
-    """Force a fresh load from disk (e.g. after db_builder runs)."""
     global _db
     _db = None
     _load_db()
@@ -67,21 +71,56 @@ def db_is_ready() -> bool:
     return bool(_db)
 
 
-def _preprocess(img: Image.Image) -> Image.Image:
-    """Convert to grayscale, enhance local contrast, resize to standard dims."""
-    arr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+# ── preprocessing ─────────────────────────────────────────────────────────────
 
-    # CLAHE improves matching under variable screen brightness/gamma
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    arr = clahe.apply(arr)
-
-    arr = cv2.resize(arr, (_HASH_W, _HASH_H), interpolation=cv2.INTER_AREA)
-    return Image.fromarray(arr)
+def _to_gray(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
 
 
-def compute_hash(img: Image.Image) -> imagehash.ImageHash:
-    return imagehash.phash(_preprocess(img))
+def _apply_clahe(arr: np.ndarray, clip: float = 2.0) -> np.ndarray:
+    return cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(arr)
 
+
+def _resize(arr: np.ndarray) -> np.ndarray:
+    return cv2.resize(arr, (_HASH_W, _HASH_H), interpolation=cv2.INTER_AREA)
+
+
+def _variants(img: Image.Image) -> List[Image.Image]:
+    """Return several preprocessed versions of the capture to try.
+
+    v1  Plain CLAHE — works well for clean screen captures.
+    v2  Denoise → CLAHE — removes webcam sensor noise first.
+    v3  Denoise → sharpen → CLAHE — recovers detail lost to webcam blur.
+    v4  Bilateral filter → CLAHE — edge-preserving smooth for low-light shots.
+    """
+    gray = _to_gray(img)
+    out = []
+
+    # v1: plain CLAHE
+    v1 = _apply_clahe(gray.copy())
+    out.append(Image.fromarray(_resize(v1)))
+
+    # v2: fast denoise → CLAHE
+    v2 = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+    v2 = _apply_clahe(v2)
+    out.append(Image.fromarray(_resize(v2)))
+
+    # v3: denoise → sharpen → CLAHE
+    v3 = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
+    v3 = cv2.filter2D(v3, -1, _SHARPEN_KERNEL)
+    v3 = np.clip(v3, 0, 255).astype(np.uint8)
+    v3 = _apply_clahe(v3, clip=3.0)
+    out.append(Image.fromarray(_resize(v3)))
+
+    # v4: bilateral (preserves edges, smooths flat areas) → CLAHE
+    v4 = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    v4 = _apply_clahe(v4)
+    out.append(Image.fromarray(_resize(v4)))
+
+    return out
+
+
+# ── matching ──────────────────────────────────────────────────────────────────
 
 def find_best_match(img: Image.Image) -> Optional[Tuple[str, int]]:
     """Return (card_name, hamming_distance) for the closest match, or None."""
@@ -89,21 +128,25 @@ def find_best_match(img: Image.Image) -> Optional[Tuple[str, int]]:
     if not _db:
         return None
 
-    query_int = int(str(compute_hash(img)), 16)
+    query_ints = [int(str(imagehash.phash(v)), 16) for v in _variants(img)]
+    logger.debug("Trying %d preprocessing variants", len(query_ints))
 
     best_name: Optional[str] = None
     best_dist = HASH_MATCH_THRESHOLD + 1
 
     for name, hash_int in _db:
-        dist = bin(query_int ^ hash_int).count("1")
-        if dist < best_dist:
-            best_dist = dist
-            best_name = name
-            if dist == 0:
-                break  # perfect match; stop early
+        for q in query_ints:
+            dist = bin(q ^ hash_int).count("1")
+            if dist < best_dist:
+                best_dist = dist
+                best_name = name
+            if best_dist == 0:
+                break
+        if best_dist == 0:
+            break
 
     if best_name and best_dist <= HASH_MATCH_THRESHOLD:
-        logger.info("Recognised '%s' (Hamming distance %d)", best_name, best_dist)
+        logger.info("Recognised '%s' (distance %d)", best_name, best_dist)
         return best_name, best_dist
 
     logger.warning("No match within threshold (best distance %d)", best_dist)

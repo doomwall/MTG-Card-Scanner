@@ -50,5 +50,5 @@ API_RATE_LIMIT_DELAY = 0.1
 MIN_SELECTION_SIZE = 20
 
 # Maximum perceptual hash Hamming distance (0–64) to count as a match.
-# Lower is stricter. 10 works well for clean digital card renders.
-HASH_MATCH_THRESHOLD = 15
+# 15 = good for clean screen captures; raise to 20–22 for webcam quality.
+HASH_MATCH_THRESHOLD = 20
