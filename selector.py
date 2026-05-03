@@ -1,9 +1,8 @@
 """Fullscreen region-selection overlay.
 
-Takes a screenshot of the screen, displays it as a frozen background,
-then lets the user drag a selection rectangle over it at full opacity.
-The selection border and size label are always crisp regardless of the
-underlying content.
+Takes a screenshot, shows a pre-dimmed version as the background, then
+reveals the original (undimmed) screenshot inside the drag rectangle so
+the card stands out clearly from the rest of the screen.
 
 Must be called from the main tkinter thread.
 Returns (x1, y1, x2, y2) in physical screen pixels, or None if cancelled.
@@ -21,22 +20,25 @@ from config import MIN_SELECTION_SIZE
 logger = logging.getLogger(__name__)
 
 _HINT    = "Drag to select a card  •  ESC to cancel"
-_OUTLINE = "#00ff41"   # bright green selection border
-_DIM     = "gray25"    # stipple pattern for the dark overlay (~25% opacity)
-_CLEAR   = "gray75"    # stipple for inside the selection (lighter dimming)
+_OUTLINE = "#00ff41"
+_DIM     = 0.45   # how dark the overlay is (0 = black, 1 = original)
 
 
 def select_region(parent: tk.Tk) -> Optional[Tuple[int, int, int, int]]:
     result: list = [None]
     start:  list = [0, 0]
 
-    # ── 1. capture the screen before the overlay window appears ──────────
+    # ── 1. grab screen before the overlay appears ─────────────────────────
     with mss.mss() as sct:
-        monitor = sct.monitors[1]   # primary monitor
+        monitor = sct.monitors[1]
         shot = sct.grab(monitor)
-        bg = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        bg_orig = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
-    # ── 2. build fullscreen window at full opacity ────────────────────────
+    # Pre-compute dimmed version once (blend with black at DIM factor)
+    black = Image.new("RGB", bg_orig.size, (0, 0, 0))
+    bg_dim = Image.blend(bg_orig, black, alpha=1.0 - _DIM)
+
+    # ── 2. fullscreen window ──────────────────────────────────────────────
     win = tk.Toplevel(parent)
     win.attributes("-fullscreen", True)
     win.attributes("-topmost", True)
@@ -49,48 +51,49 @@ def select_region(parent: tk.Tk) -> Optional[Tuple[int, int, int, int]]:
     canvas = tk.Canvas(win, cursor="crosshair", highlightthickness=0, bg="black")
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    # Keep a reference so the image isn't garbage-collected
-    _tk_bg = ImageTk.PhotoImage(bg)
-    canvas.create_image(0, 0, image=_tk_bg, anchor="nw", tags="bg")
+    # Dimmed background (kept as attribute to prevent GC)
+    _tk_dim = ImageTk.PhotoImage(bg_dim)
+    canvas.create_image(0, 0, image=_tk_dim, anchor="nw")
 
-    # Dark stipple over the whole screen
-    canvas.create_rectangle(
-        0, 0, sw, sh,
-        fill="black", stipple=_DIM, outline="", tags="overlay"
-    )
+    # Selection reveal image — starts as 1×1 placeholder
+    _tk_sel = [ImageTk.PhotoImage(Image.new("RGB", (1, 1)))]
+    sel_img = canvas.create_image(0, 0, image=_tk_sel[0], anchor="nw")
 
-    # Instruction text
-    canvas.create_text(
-        sw // 2, 28,
-        text=_HINT,
-        fill="white",
-        font=("Segoe UI", 13, "bold"),
-        tags="hint",
-    )
-
-    # Placeholder canvas items for the live selection
-    inside = canvas.create_rectangle(0, 0, 0, 0, fill="black", stipple=_CLEAR, outline="")
+    # Selection border and size label drawn on top
     border = canvas.create_rectangle(0, 0, 0, 0, outline=_OUTLINE, width=2, fill="")
-    sizelabel = canvas.create_text(0, 0, text="", fill=_OUTLINE, font=("Segoe UI", 9, "bold"))
+    sizelabel = canvas.create_text(
+        0, 0, text="", anchor="nw",
+        fill=_OUTLINE, font=("Segoe UI", 9, "bold"),
+    )
+
+    # Hint text
+    canvas.create_text(
+        sw // 2, 28, text=_HINT,
+        fill="white", font=("Segoe UI", 13, "bold"),
+    )
 
     # ── event handlers ────────────────────────────────────────────────────
 
     def on_press(event: tk.Event) -> None:
         start[0], start[1] = event.x, event.y
-        # Collapse selection to a point
-        for item in (inside, border, sizelabel):
-            canvas.coords(item, event.x, event.y, event.x, event.y)
 
     def on_drag(event: tk.Event) -> None:
         x1 = min(start[0], event.x)
         y1 = min(start[1], event.y)
         x2 = max(start[0], event.x)
         y2 = max(start[1], event.y)
-        canvas.coords(inside, x1, y1, x2, y2)
+
+        if x2 > x1 and y2 > y1:
+            # Reveal original screenshot inside the selection
+            crop = bg_orig.crop((x1, y1, x2, y2))
+            _tk_sel[0] = ImageTk.PhotoImage(crop)
+            canvas.coords(sel_img, x1, y1)
+            canvas.itemconfig(sel_img, image=_tk_sel[0])
+
         canvas.coords(border, x1, y1, x2, y2)
-        # Size label just above the top-left corner, or below if near top edge
+
         lx = x1 + 4
-        ly = y1 - 14 if y1 > 20 else y2 + 14
+        ly = y1 - 16 if y1 > 22 else y2 + 4
         canvas.coords(sizelabel, lx, ly)
         canvas.itemconfig(sizelabel, text=f"{x2 - x1} × {y2 - y1} px")
 
